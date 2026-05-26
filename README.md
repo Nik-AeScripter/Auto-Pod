@@ -1,39 +1,39 @@
 # Auto-Pod
 
-A local-first AI video editor for podcasts and talking-head video. Three interfaces, one pipeline:
+A local-first AI video editor for podcasts and talking-head video.
 
-- **Web UI** — drag-and-drop, configure, preview, download.
-- **CLI** — `auto-pod silence in.mp4 out.mp4`.
-- **REST API** — JSON in, video out. Fully documented.
+Built incrementally — one feature at a time. **Currently shipped: silence removal.**
 
-Everything runs on your machine. No cloud, no upload, no account.
+## Status
 
-## Features
-
-| Feature | Status (Day 1) | How it works |
+| Feature | Status | Try it |
 |---|---|---|
-| **Silence remover** | Working | Whisper word timestamps → cut between words. Falls back to ffmpeg `silencedetect` if you opt out. |
-| **Auto chapters** | Working | TF-IDF similarity over the transcript locates topic shifts; titles picked from the most distinctive sentence. |
-| **Repeat takes remover** | Day 2 | Sentence-embedding similarity over the transcript; keep the last/best take. |
-| **Auto multicam editor** | Day 2 | Audio cross-correlation for sync; per-window speaker activity for switching. |
-| **Exports** | Day 2 | MP4 / MOV / WebM, plus FCPXML, Premiere XML, EDL. |
+| Silence remover (Silero VAD + dB) | ✅ Ready | `auto-pod silence in.mp4 out.mp4` |
+| Auto chapters | 🚧 Next | — |
+| Repeat-takes remover | 🚧 Planned | — |
+| Auto multicam editor | 🚧 Planned | — |
+| Exports (MP4 / MOV / WebM / FCPXML / Premiere XML / EDL) | 🚧 Planned | — |
+| Web UI | 🚧 Planned | — |
 
-## Why transcript-driven cuts?
+## How silence removal works
 
-Cuts are placed using Whisper's word-level timestamps, not amplitude. This means:
+This is a faithful port of the method from [EduardoAndreu/clean-cut](https://github.com/EduardoAndreu/clean-cut), adapted to render a standalone output video instead of pushing cuts into Premiere Pro. Approach (rephrased for compliance with licensing restrictions):
 
-- Background noise, music, breaths, lip smacks don't fool the cutter.
-- Cuts always land between words, never mid-syllable.
-- One transcription pass powers silence + repeats + chapters.
+1. **Decode** — ffmpeg extracts the audio as 16 kHz mono WAV.
+2. **VAD** — [Silero VAD](https://github.com/snakers4/silero-vad) (a small neural net) classifies each 16 kHz frame as speech or non-speech and returns a list of speech intervals.
+3. **dB safety net** — for each gap between speech segments, RMS dB is computed. The gap is *confirmed* as silence only if it's below your threshold (default `-35 dB`). This protects loud non-speech (music, applause, noise) from being cut.
+4. **Padding** — confirmed silences are shrunk by `padding_ms` on each side (default 150 ms) so we don't clip word starts/ends.
+5. **Merge** — silences within 0.5 s of each other are merged into one.
+6. **Render** — the inverse (kept ranges) is concatenated by ffmpeg into a new video, frame-accurate by default.
 
-Amplitude mode (`--mode amplitude`) is still available for users who don't want to run Whisper.
+ffmpeg is **only** used as a decoder/encoder. All cut decisions are timestamp-based.
 
 ## Requirements
 
-- **ffmpeg / ffprobe** on PATH (used for decoding & rendering only — Python has no equivalent).
+- **ffmpeg / ffprobe** on PATH.
 - **Python 3.10+**.
-- ~500 MB disk for the default Whisper `small` model on first run.
-- (Optional) NVIDIA GPU for faster transcription.
+- ~30 MB disk for Silero VAD on first run (auto-downloaded).
+- ~500 MB RAM during processing. CPU is fine; GPU optional.
 
 ### Install ffmpeg
 
@@ -44,30 +44,88 @@ brew install ffmpeg
 # Ubuntu/Debian
 sudo apt install ffmpeg
 
-# Windows
-# Download from https://ffmpeg.org/download.html and add bin/ to PATH
+# Windows: https://ffmpeg.org/download.html  (add bin/ to PATH)
 ```
 
-## Quick start (CLI)
+## Install
 
 ```bash
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
+git clone https://github.com/Nik-AeScripter/Auto-Pod
+cd Auto-Pod/backend
+python3 -m venv .venv
+source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -e .
-
-# Probe a file
-auto-pod probe input.mp4
-
-# Remove silences (transcript mode, recommended)
-auto-pod silence input.mp4 output.mp4
-
-# Faster, model-free silence removal
-auto-pod silence input.mp4 output.mp4 --mode amplitude --noise-db -28
-
-# Auto chapters
-auto-pod chapters input.mp4 --json chapters.json
 ```
+
+> First run downloads the Silero VAD weights (~30 MB) and PyTorch (~100 MB).
+
+## Try it (silence removal)
+
+```bash
+# Probe a file (sanity check ffmpeg is wired up)
+auto-pod probe path/to/your-video.mp4
+
+# Remove silences with defaults (matches clean-cut: -35 dB, 150 ms padding)
+auto-pod silence path/to/your-video.mp4 path/to/output.mp4
+
+# More aggressive (quieter threshold, less padding)
+auto-pod silence in.mp4 out.mp4 --threshold-db -40 --padding-ms 80
+
+# Less aggressive (catch more loud noise as "kept")
+auto-pod silence in.mp4 out.mp4 --threshold-db -25 --padding-ms 200
+
+# See exactly what would be cut, without rendering (fast)
+auto-pod silence in.mp4 out.mp4 --dry-run --json cuts.json
+
+# Stream-copy for faster but keyframe-aligned cuts
+auto-pod silence in.mp4 out.mp4 --no-reencode
+
+# Verbose logs (shows VAD progress, ffmpeg cmds, dB checks)
+auto-pod silence in.mp4 out.mp4 -v
+```
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--threshold-db, -t` | `-35.0` | Silence is confirmed only if quieter than this |
+| `--min-silence-ms` | `200` | Ignore silences shorter than this |
+| `--min-speech-ms` | `250` | Ignore speech bursts shorter than this |
+| `--padding-ms, -p` | `150` | Keep this much audio on each side of cuts |
+| `--merge-gap` | `0.5` | Merge silences within this many seconds |
+| `--vad-threshold` | `0.5` | Silero VAD confidence (0..1, higher = stricter) |
+| `--no-reencode` | off | Stream-copy cuts at keyframes (faster, less precise) |
+| `--dry-run` | off | Analyze only, skip rendering |
+| `--json` | — | Write the full edit decision (cuts, kept, stats) |
+
+## What the JSON looks like
+
+`auto-pod silence in.mp4 out.mp4 --dry-run --json cuts.json` produces:
+
+```json
+{
+  "kept_segments": [
+    {"source": "in.mp4", "start": 0.0,   "end": 4.85,  "duration": 4.85,  "track_index": 0, "label": "speech"},
+    {"source": "in.mp4", "start": 6.32,  "end": 12.10, "duration": 5.78,  "track_index": 0, "label": "speech"}
+  ],
+  "removed_ranges": [
+    {"start": 4.85, "end": 6.32, "duration": 1.47}
+  ],
+  "notes": {
+    "method": "silero_vad+db_threshold",
+    "input_duration": 12.10,
+    "speech_segments_detected": 2,
+    "candidate_silences": 3,
+    "confirmed_silences": 1,
+    "final_silences": 1,
+    "config": { "silence_threshold_db": -35.0, "padding_ms": 150, ... }
+  },
+  "stats": { "total_kept_seconds": 10.63, "total_removed_seconds": 1.47 }
+}
+```
+
+That JSON is what later features (multicam, exports) will consume.
 
 ## Project layout
 
@@ -78,34 +136,27 @@ auto-pod/
 │   │   ├── cli.py             # Typer CLI
 │   │   ├── models.py          # Shared dataclasses
 │   │   ├── pipeline/
-│   │   │   ├── silence.py     # Silence removal (transcript + amplitude modes)
-│   │   │   ├── chapters.py    # Auto chapters
-│   │   │   ├── repeats.py     # Day 2: repeat-takes
-│   │   │   ├── multicam.py    # Day 2: multicam
-│   │   │   └── render.py      # Day 2: export & XML writers
+│   │   │   └── silence.py     # Silero VAD + dB silence removal
 │   │   └── utils/
-│   │       ├── ffmpeg.py      # ffmpeg/ffprobe wrappers
-│   │       └── transcribe.py  # faster-whisper wrapper
-│   ├── tests/                 # Pure-Python logic tests
+│   │       ├── ffmpeg.py      # ffmpeg/ffprobe wrappers (decode/encode only)
+│   │       └── vad.py         # Silero VAD wrapper
+│   ├── tests/                 # Pure-Python logic tests (no ffmpeg/VAD needed)
 │   └── requirements.txt
-├── frontend/                  # Day 3: Next.js UI
 └── README.md
 ```
 
-## How the silence pipeline works
+## Run the tests
 
-1. **Probe** — `ffprobe` extracts duration, codecs, audio info.
-2. **Transcribe** — `faster-whisper` (local) produces word-level timestamps.
-3. **Decide** — words are merged into "speech spans" wherever the gap is shorter than `--min-silence`. Spans get padded by `--pad`.
-4. **Render** — kept spans are concatenated. We re-encode by default for frame-accurate cuts; `--no-reencode` falls back to stream-copy at keyframes.
+```bash
+cd backend
+PYTHONPATH=. pytest tests/ -v
+```
 
-The `EditDecision` returned from `analyze()` is fully serializable JSON — every cut and every chapter is auditable.
+These cover the cut math (interval inversion, dB filtering, padding, merging) without needing ffmpeg, torch, or audio files.
 
-## Roadmap
+## Credits
 
-- **Day 1 (now)** — silence + chapters, CLI, logic tests.
-- **Day 2** — repeats, multicam, FastAPI, FCPXML/Premiere XML/EDL exports.
-- **Day 3** — Next.js UI with shadcn/Tailwind, Docker compose, polish.
+Silence-removal method ported from [EduardoAndreu/clean-cut](https://github.com/EduardoAndreu/clean-cut) (MIT). Speech detection by [Silero VAD](https://github.com/snakers4/silero-vad).
 
 ## License
 

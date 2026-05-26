@@ -1,225 +1,255 @@
-"""Silence removal pipeline.
+"""Silence removal pipeline — Silero VAD + dB threshold confirmation.
 
-PRIMARY MODE — `mode="transcript"` (default, recommended):
-  1. Transcribe audio with Whisper (word-level timestamps).
-  2. The "silent" regions are simply the gaps BETWEEN words.
-  3. Cuts are placed exactly between words, never mid-syllable.
-  4. Render via segment-concat.
+This is a faithful port of the method used by EduardoAndreu/clean-cut
+(https://github.com/EduardoAndreu/clean-cut), adapted to render a standalone
+output video instead of pushing cuts into Premiere Pro.
 
-This is more robust than amplitude-based detection because:
-  - background noise / music doesn't register as "speech"
-  - breaths, lip smacks, keyboard clicks don't survive the transcript
-  - cuts always land on word boundaries
+Pipeline:
+  1. Extract audio as 16 kHz mono WAV (ffmpeg, decoder only).
+  2. Run Silero VAD to get SPEECH intervals.
+  3. Invert: candidate silences are the gaps between speech segments
+     (plus head/tail).
+  4. For each candidate silence, compute RMS dB over that range.
+     Confirm it as silence only if dB < silence_threshold_db.
+     This is the "safety net" from clean-cut — protects loud non-speech
+     (music, applause, noise) from being cut.
+  5. Shrink each confirmed silence by `padding_ms` on both sides
+     (leaves breathing room around words).
+  6. Merge silences less than `merge_gap_sec` apart.
+  7. Invert again -> kept segments.
+  8. Render via ffmpeg segment-concat.
 
-FALLBACK MODE — `mode="amplitude"`:
-  Uses ffmpeg `silencedetect` (energy threshold). Faster (no model download)
-  but less accurate. Available for users who don't want to run Whisper.
-
-ffmpeg/ffprobe are still used to (a) probe duration/streams and (b) render the
-final output — Python has no replacement for that. Only the *decision* of where
-to cut has been moved to the transcript.
+The decision step is *entirely* timestamp-based. ffmpeg is only used to
+decode audio and encode the final video.
 """
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
-from ..models import CutSegment, EditDecision, TimeRange, TranscriptSegment
-from ..utils import ffmpeg
-from ..utils.transcribe import TranscribeConfig, transcribe
+import numpy as np
+
+from ..models import CutSegment, EditDecision, TimeRange
+from ..utils import ffmpeg as ffu
+from ..utils.vad import VAD_SAMPLE_RATE, VADConfig, detect_speech_intervals
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class SilenceConfig:
-    # Mode
-    mode: Literal["transcript", "amplitude"] = "transcript"
+    # dB safety net (matches clean-cut default of -35 dB)
+    silence_threshold_db: float = -35.0
 
-    # Common
-    min_silence_sec: float = 0.5     # gaps shorter than this are NOT removed
-    pad_sec: float = 0.05            # keep this much extra audio around each kept span
-    min_keep_sec: float = 0.10       # drop tiny kept slivers
+    # VAD timing
+    min_silence_ms: int = 200       # gaps shorter than this aren't candidate silences
+    min_speech_ms: int = 250        # ignore tiny speech bursts (clicks, lip smacks)
+    speech_pad_ms: int = 30         # VAD's own padding around each speech span
+    vad_threshold: float = 0.5      # VAD confidence cutoff (0..1)
 
-    # Amplitude-mode only
-    noise_db: float = -30.0
+    # Cut padding (matches clean-cut default of 150 ms)
+    padding_ms: int = 150           # shrink silences by this much on each side
 
-    # Transcript-mode only
-    transcribe: TranscribeConfig = None  # type: ignore[assignment]
-
-
-def _word_intervals(transcript: list[TranscriptSegment]) -> list[tuple[float, float]]:
-    """Flatten transcript into a sorted list of (word_start, word_end) intervals.
-
-    Falls back to segment-level intervals if word timestamps are missing.
-    """
-    intervals: list[tuple[float, float]] = []
-    for seg in transcript:
-        had_words = False
-        for w in seg.words or []:
-            ws, we = w.get("start"), w.get("end")
-            if ws is None or we is None:
-                continue
-            if we > ws:
-                intervals.append((float(ws), float(we)))
-                had_words = True
-        if not had_words and seg.end > seg.start:
-            intervals.append((float(seg.start), float(seg.end)))
-    intervals.sort(key=lambda x: x[0])
-    return intervals
+    # Post-processing
+    merge_gap_sec: float = 0.5      # merge silences closer than this together
+    min_silence_to_cut_sec: float = 0.30  # don't bother cutting silences shorter than this
 
 
-def _merge_close_intervals(
-    intervals: list[tuple[float, float]],
-    *,
-    min_gap_sec: float,
+def _rms_db_of_range(samples: np.ndarray, sample_rate: int, start_s: float, end_s: float) -> float:
+    """Compute RMS dB over [start_s, end_s) of the audio array (full-scale = 0 dB)."""
+    i0 = max(0, int(start_s * sample_rate))
+    i1 = min(len(samples), int(end_s * sample_rate))
+    if i1 <= i0:
+        return -90.0
+    chunk = samples[i0:i1].astype(np.float64)
+    rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+    if rms <= 0:
+        return -90.0
+    # samples are float32 in [-1, 1] (full-scale = 1.0)
+    return 20.0 * math.log10(rms)
+
+
+def _read_wav_float(path: str | Path) -> tuple[np.ndarray, int]:
+    import soundfile as sf
+    data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if data.ndim == 2:
+        data = data.mean(axis=1).astype("float32")
+    return data, int(sr)
+
+
+def _invert_to_silences(
+    speech: list[tuple[float, float]],
+    total_duration: float,
 ) -> list[tuple[float, float]]:
-    """Merge two adjacent word/speech intervals if the gap between them is < min_gap_sec."""
-    if not intervals:
+    """Return gaps between speech intervals (plus leading/trailing silence)."""
+    if not speech:
+        return [(0.0, total_duration)]
+    silences: list[tuple[float, float]] = []
+    if speech[0][0] > 0:
+        silences.append((0.0, speech[0][0]))
+    for i in range(len(speech) - 1):
+        silences.append((speech[i][1], speech[i + 1][0]))
+    if speech[-1][1] < total_duration:
+        silences.append((speech[-1][1], total_duration))
+    return silences
+
+
+def _filter_by_db(
+    candidates: list[tuple[float, float]],
+    samples: np.ndarray,
+    sample_rate: int,
+    threshold_db: float,
+) -> list[tuple[float, float]]:
+    """Keep only candidates whose RMS dB is below the threshold."""
+    confirmed: list[tuple[float, float]] = []
+    for s, e in candidates:
+        if e - s <= 0:
+            continue
+        db = _rms_db_of_range(samples, sample_rate, s, e)
+        if db < threshold_db:
+            confirmed.append((s, e))
+        else:
+            log.debug("Skipping silence %.2f-%.2f (%.1f dB >= %.1f dB threshold)",
+                      s, e, db, threshold_db)
+    return confirmed
+
+
+def _pad_silences(
+    silences: list[tuple[float, float]],
+    *,
+    padding_ms: int,
+    min_silence_to_cut_sec: float,
+) -> list[tuple[float, float]]:
+    """Shrink each silence by padding_ms on both sides; drop ones too short to cut."""
+    pad = padding_ms / 1000.0
+    out: list[tuple[float, float]] = []
+    for s, e in silences:
+        ns, ne = s + pad, e - pad
+        if ne - ns >= min_silence_to_cut_sec:
+            out.append((ns, ne))
+    return out
+
+
+def _merge_close(
+    silences: list[tuple[float, float]],
+    *,
+    max_gap_sec: float,
+) -> list[tuple[float, float]]:
+    if not silences:
         return []
-    merged = [intervals[0]]
-    for s, e in intervals[1:]:
+    merged = [silences[0]]
+    for s, e in silences[1:]:
         ps, pe = merged[-1]
-        if s - pe < min_gap_sec:
+        if s - pe < max_gap_sec:
             merged[-1] = (ps, max(pe, e))
         else:
             merged.append((s, e))
     return merged
 
 
-def _analyze_transcript(
-    input_path: str | Path,
-    cfg: SilenceConfig,
-) -> EditDecision:
-    """Use Whisper word timestamps to decide what to keep."""
-    info = ffmpeg.probe(input_path)
-    if not info.has_audio:
-        return EditDecision(
-            kept_segments=[CutSegment(source=str(input_path), start=0.0, end=info.duration)],
-            removed_ranges=[],
-            notes={"reason": "no_audio_track", "duration": info.duration},
-        )
-
-    transcript = transcribe(input_path, cfg.transcribe or TranscribeConfig())
-
-    word_intervals = _word_intervals(transcript)
-    # Merge words that are closer together than min_silence_sec — those gaps are NOT silence.
-    speech = _merge_close_intervals(word_intervals, min_gap_sec=cfg.min_silence_sec)
-
-    if not speech:
-        # No speech detected — fall back to amplitude method so we still produce something
-        log.warning("Transcript produced no words; falling back to amplitude silencedetect.")
-        return _analyze_amplitude(input_path, cfg, _info=info)
-
-    # Pad each speech span and clamp to media duration
-    kept_pairs: list[tuple[float, float]] = []
-    for s, e in speech:
-        s2 = max(0.0, s - cfg.pad_sec)
-        e2 = min(info.duration, e + cfg.pad_sec)
-        if e2 - s2 >= cfg.min_keep_sec:
-            kept_pairs.append((s2, e2))
-
-    # Merge overlaps caused by padding
-    kept_pairs = _merge_close_intervals(kept_pairs, min_gap_sec=0.001)
-
-    # Removed = the inverse
-    removed_pairs: list[tuple[float, float]] = []
+def _silences_to_kept(
+    silences: list[tuple[float, float]],
+    total_duration: float,
+) -> list[tuple[float, float]]:
+    """Invert silences back into kept-segment intervals."""
+    kept: list[tuple[float, float]] = []
     cursor = 0.0
-    for s, e in kept_pairs:
-        if s > cursor + 0.001:
-            removed_pairs.append((cursor, s))
-        cursor = e
-    if info.duration > cursor + 0.001:
-        removed_pairs.append((cursor, info.duration))
-
-    kept = [
-        CutSegment(source=str(input_path), start=s, end=e, label="speech")
-        for s, e in kept_pairs
-    ]
-    removed = [TimeRange(start=s, end=e) for s, e in removed_pairs]
-
-    return EditDecision(
-        kept_segments=kept,
-        removed_ranges=removed,
-        transcript=transcript,
-        notes={
-            "feature": "silence",
-            "mode": "transcript",
-            "config": {k: v for k, v in vars(cfg).items() if k != "transcribe"},
-            "input_duration": info.duration,
-            "word_count": sum(len(s.words or []) for s in transcript),
-        },
-    )
-
-
-def _analyze_amplitude(
-    input_path: str | Path,
-    cfg: SilenceConfig,
-    *,
-    _info=None,
-) -> EditDecision:
-    """Legacy amplitude-based path using ffmpeg silencedetect."""
-    info = _info or ffmpeg.probe(input_path)
-    if not info.has_audio:
-        return EditDecision(
-            kept_segments=[CutSegment(source=str(input_path), start=0.0, end=info.duration)],
-            removed_ranges=[],
-            notes={"reason": "no_audio_track", "duration": info.duration},
-        )
-
-    silences = ffmpeg.detect_silence(
-        input_path,
-        noise_db=cfg.noise_db,
-        min_silence_sec=cfg.min_silence_sec,
-    )
-    log.info("silencedetect found %d silent ranges", len(silences))
-
-    # shrink silent ranges by pad
-    padded: list[tuple[float, float]] = []
     for s, e in silences:
-        s2 = max(0.0, s + cfg.pad_sec)
-        e2 = min(info.duration, e - cfg.pad_sec)
-        if e2 - s2 >= max(0.05, cfg.min_silence_sec * 0.5):
-            padded.append((s2, e2))
-
-    # invert
-    kept_pairs: list[tuple[float, float]] = []
-    cursor = 0.0
-    for s, e in padded:
-        if s > cursor + cfg.min_keep_sec:
-            kept_pairs.append((cursor, s))
+        if s > cursor + 1e-3:
+            kept.append((cursor, s))
         cursor = e
-    if info.duration > cursor + cfg.min_keep_sec:
-        kept_pairs.append((cursor, info.duration))
-
-    kept = [CutSegment(source=str(input_path), start=s, end=e, label="speech") for s, e in kept_pairs]
-    removed = [TimeRange(start=s, end=e) for s, e in padded]
-
-    return EditDecision(
-        kept_segments=kept,
-        removed_ranges=removed,
-        notes={
-            "feature": "silence",
-            "mode": "amplitude",
-            "config": {"noise_db": cfg.noise_db,
-                       "min_silence_sec": cfg.min_silence_sec,
-                       "pad_sec": cfg.pad_sec,
-                       "min_keep_sec": cfg.min_keep_sec},
-            "input_duration": info.duration,
-        },
-    )
+    if total_duration > cursor + 1e-3:
+        kept.append((cursor, total_duration))
+    return kept
 
 
 def analyze(
     input_path: str | Path,
     cfg: Optional[SilenceConfig] = None,
 ) -> EditDecision:
+    """Run VAD + dB analysis. Returns an EditDecision; does NOT render."""
     cfg = cfg or SilenceConfig()
-    if cfg.mode == "amplitude":
-        return _analyze_amplitude(input_path, cfg)
-    return _analyze_transcript(input_path, cfg)
+    info = ffu.probe(input_path)
+
+    if not info.has_audio or info.duration <= 0:
+        whole = [CutSegment(source=str(input_path), start=0.0, end=info.duration)]
+        return EditDecision(
+            kept_segments=whole,
+            removed_ranges=[],
+            notes={"feature": "silence", "reason": "no_audio_track",
+                   "input_duration": info.duration},
+        )
+
+    # Step 1: extract 16 kHz mono WAV (ffmpeg = decoder only)
+    wav_path = Path(input_path).with_suffix(".__autopod_silence__.wav")
+    try:
+        ffu.extract_audio_wav(input_path, wav_path, sample_rate=VAD_SAMPLE_RATE, channels=1)
+
+        # Step 2: VAD speech detection
+        vad_cfg = VADConfig(
+            min_speech_ms=cfg.min_speech_ms,
+            min_silence_ms=cfg.min_silence_ms,
+            speech_pad_ms=cfg.speech_pad_ms,
+            threshold=cfg.vad_threshold,
+        )
+        speech = detect_speech_intervals(wav_path, vad_cfg)
+
+        # Step 3: candidate silences = gaps between speech
+        samples, sr = _read_wav_float(wav_path)
+        wav_duration = len(samples) / sr if sr else info.duration
+        candidates = _invert_to_silences(speech, wav_duration)
+
+        # Step 4: dB safety net (clean-cut's idea: confirm silence by amplitude)
+        confirmed = _filter_by_db(candidates, samples, sr, cfg.silence_threshold_db)
+
+        # Step 5: padding (shrink each silence to leave breathing room)
+        padded = _pad_silences(
+            confirmed,
+            padding_ms=cfg.padding_ms,
+            min_silence_to_cut_sec=cfg.min_silence_to_cut_sec,
+        )
+
+        # Step 6: merge nearby silences
+        merged = _merge_close(padded, max_gap_sec=cfg.merge_gap_sec)
+
+        # Step 7: invert -> kept segments
+        kept_pairs = _silences_to_kept(merged, info.duration)
+    finally:
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+
+    kept = [
+        CutSegment(source=str(input_path), start=s, end=e, label="speech")
+        for s, e in kept_pairs
+    ]
+    removed = [TimeRange(start=s, end=e) for s, e in merged]
+
+    return EditDecision(
+        kept_segments=kept,
+        removed_ranges=removed,
+        notes={
+            "feature": "silence",
+            "method": "silero_vad+db_threshold",
+            "config": {
+                "silence_threshold_db": cfg.silence_threshold_db,
+                "min_silence_ms": cfg.min_silence_ms,
+                "min_speech_ms": cfg.min_speech_ms,
+                "padding_ms": cfg.padding_ms,
+                "merge_gap_sec": cfg.merge_gap_sec,
+                "vad_threshold": cfg.vad_threshold,
+            },
+            "input_duration": info.duration,
+            "speech_segments_detected": len(speech),
+            "candidate_silences": len(candidates),
+            "confirmed_silences": len(confirmed),
+            "final_silences": len(merged),
+        },
+    )
 
 
 def render(
@@ -231,7 +261,7 @@ def render(
     if not decision.kept_segments:
         raise RuntimeError("Silence pipeline produced no kept segments; nothing to render.")
     triplets = [(s.source, s.start, s.end) for s in decision.kept_segments]
-    return ffmpeg.render_segments(triplets, output_path, reencode=reencode)
+    return ffu.render_segments(triplets, output_path, reencode=reencode)
 
 
 def run(

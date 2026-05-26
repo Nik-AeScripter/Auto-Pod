@@ -1,10 +1,10 @@
 """Auto-Pod command-line interface.
 
-Examples:
-    auto-pod silence input.mp4 output.mp4
-    auto-pod silence input.mp4 output.mp4 --mode amplitude --noise-db -28
-    auto-pod chapters input.mp4 --json chapters.json
-    auto-pod probe input.mp4
+Currently implemented:
+  auto-pod probe   <input>                        -- probe media info
+  auto-pod silence <input> <output>               -- remove silences (Silero VAD + dB)
+
+Coming next: chapters, repeats, multicam, exports.
 """
 from __future__ import annotations
 
@@ -19,10 +19,8 @@ from rich.console import Console
 from rich.table import Table
 
 from .models import EditDecision
-from .pipeline import chapters as chapters_pipe
 from .pipeline import silence as silence_pipe
 from .utils import ffmpeg as ffu
-from .utils.transcribe import TranscribeConfig
 
 app = typer.Typer(
     add_completion=False,
@@ -66,79 +64,73 @@ def probe(input: Path = typer.Argument(..., exists=True, dir_okay=False, readabl
 def silence(
     input: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
     output: Path = typer.Argument(..., dir_okay=False, writable=True),
-    mode: str = typer.Option(
-        "transcript",
-        "--mode",
-        help="`transcript` (Whisper, recommended) or `amplitude` (ffmpeg silencedetect).",
+    threshold_db: float = typer.Option(
+        -35.0, "--threshold-db", "-t",
+        help="Confirm silence only if dB level is below this. Default matches clean-cut.",
     ),
-    min_silence: float = typer.Option(0.5, "--min-silence", help="Min silence length to remove (sec)."),
-    pad: float = typer.Option(0.05, "--pad", help="Padding to keep around speech (sec)."),
-    noise_db: float = typer.Option(-30.0, "--noise-db", help="(amplitude mode) silence threshold dB."),
-    model: str = typer.Option("small", "--model", help="(transcript mode) Whisper model size."),
-    language: Optional[str] = typer.Option(None, "--language", help="Force language (e.g. 'en')."),
-    no_reencode: bool = typer.Option(False, "--no-reencode", help="Stream-copy instead of re-encoding (faster, may shift cuts to keyframes)."),
-    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the edit decision to this JSON file."),
+    min_silence_ms: int = typer.Option(
+        200, "--min-silence-ms",
+        help="Ignore silences shorter than this (default 200ms).",
+    ),
+    min_speech_ms: int = typer.Option(
+        250, "--min-speech-ms",
+        help="Ignore speech bursts shorter than this (default 250ms).",
+    ),
+    padding_ms: int = typer.Option(
+        150, "--padding-ms", "-p",
+        help="Keep this much audio around each kept span (default 150ms).",
+    ),
+    merge_gap: float = typer.Option(
+        0.5, "--merge-gap",
+        help="Merge silences that are within this many seconds of each other.",
+    ),
+    vad_threshold: float = typer.Option(
+        0.5, "--vad-threshold",
+        help="Silero VAD confidence threshold (0..1). Higher = stricter speech detection.",
+    ),
+    no_reencode: bool = typer.Option(
+        False, "--no-reencode",
+        help="Stream-copy instead of re-encoding (faster, may shift cuts to keyframes).",
+    ),
+    json_out: Optional[Path] = typer.Option(
+        None, "--json",
+        help="Write the edit decision (cuts, kept segments, stats) to this JSON file.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Analyze only — don't render the output video.",
+    ),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ):
-    """Remove silences from a video. Default mode uses Whisper word timestamps."""
+    """Remove silences from a video using Silero VAD + dB threshold (clean-cut method)."""
     _setup_logging(verbose)
     _check_ffmpeg()
 
-    if mode not in ("transcript", "amplitude"):
-        console.print(f"[red]Unknown --mode '{mode}'. Use 'transcript' or 'amplitude'.[/]")
-        raise typer.Exit(code=2)
-
     cfg = silence_pipe.SilenceConfig(
-        mode=mode,  # type: ignore[arg-type]
-        min_silence_sec=min_silence,
-        pad_sec=pad,
-        noise_db=noise_db,
-        transcribe=TranscribeConfig(model_size=model, language=language),
+        silence_threshold_db=threshold_db,
+        min_silence_ms=min_silence_ms,
+        min_speech_ms=min_speech_ms,
+        padding_ms=padding_ms,
+        merge_gap_sec=merge_gap,
+        vad_threshold=vad_threshold,
     )
 
-    console.print(f"[cyan]Analyzing[/] {input} (mode={mode})…")
-    decision, out_path = silence_pipe.run(input, output, cfg, reencode=not no_reencode)
+    console.print(f"[cyan]Analyzing[/] {input}…")
+    decision = silence_pipe.analyze(input, cfg)
 
-    _print_decision_summary(decision, out_path)
+    _print_decision_summary(decision, output if not dry_run else None)
+
     if json_out:
         json_out.write_text(json.dumps(decision.to_dict(), indent=2), encoding="utf-8")
         console.print(f"[green]Wrote edit decision JSON:[/] {json_out}")
 
+    if dry_run:
+        console.print("[yellow]Dry run — skipping render.[/]")
+        return
 
-@app.command()
-def chapters(
-    input: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
-    json_out: Optional[Path] = typer.Option(None, "--json", help="Write chapters JSON."),
-    target: Optional[int] = typer.Option(None, "--target", help="Aim for ~N chapters."),
-    min_len: float = typer.Option(60.0, "--min-len", help="Minimum chapter length (sec)."),
-    model: str = typer.Option("small", "--model", help="Whisper model size."),
-    language: Optional[str] = typer.Option(None, "--language"),
-    verbose: bool = typer.Option(False, "-v", "--verbose"),
-):
-    """Generate chapter markers from spoken content."""
-    _setup_logging(verbose)
-    _check_ffmpeg()
-
-    cfg = chapters_pipe.ChapterConfig(
-        min_chapter_sec=min_len,
-        target_chapters=target,
-    )
-    transcribe_cfg = TranscribeConfig(model_size=model, language=language)
-    console.print(f"[cyan]Transcribing & chaptering[/] {input}…")
-    decision = chapters_pipe.analyze(input, cfg=cfg, transcribe_cfg=transcribe_cfg)
-
-    table = Table(title="Auto-detected chapters")
-    table.add_column("#", style="cyan")
-    table.add_column("Start", style="green")
-    table.add_column("End", style="green")
-    table.add_column("Title", style="white")
-    for i, ch in enumerate(decision.chapters, 1):
-        table.add_row(str(i), _fmt_time(ch.start), _fmt_time(ch.end), ch.title)
-    console.print(table)
-
-    if json_out:
-        json_out.write_text(json.dumps(decision.to_dict(), indent=2), encoding="utf-8")
-        console.print(f"[green]Wrote chapters JSON:[/] {json_out}")
+    console.print(f"[cyan]Rendering[/] {output}…")
+    out_path = silence_pipe.render(decision, output, reencode=not no_reencode)
+    console.print(f"[green]Done.[/] Output: {out_path}")
 
 
 def _fmt_time(t: float) -> str:
@@ -150,15 +142,25 @@ def _fmt_time(t: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
-def _print_decision_summary(decision: EditDecision, out_path: Path) -> None:
+def _print_decision_summary(decision: EditDecision, out_path: Optional[Path]) -> None:
+    notes = decision.notes or {}
+    input_dur = float(notes.get("input_duration") or 0.0)
+    saved = decision.total_removed
+    saved_pct = (100.0 * saved / input_dur) if input_dur else 0.0
+
     table = Table(title="Edit decision")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="white")
-    table.add_row("Kept segments", str(len(decision.kept_segments)))
-    table.add_row("Removed ranges", str(len(decision.removed_ranges)))
-    table.add_row("Total kept (sec)", f"{decision.total_kept:.2f}")
-    table.add_row("Total removed (sec)", f"{decision.total_removed:.2f}")
-    table.add_row("Output", str(out_path))
+    table.add_row("Method", str(notes.get("method", "?")))
+    table.add_row("Input duration", _fmt_time(input_dur))
+    table.add_row("Speech segments (VAD)", str(notes.get("speech_segments_detected", "—")))
+    table.add_row("Candidate silences", str(notes.get("candidate_silences", "—")))
+    table.add_row("Confirmed by dB", str(notes.get("confirmed_silences", "—")))
+    table.add_row("Final cuts", str(notes.get("final_silences", "—")))
+    table.add_row("Total removed", f"{_fmt_time(saved)}  ({saved_pct:.1f}% of input)")
+    table.add_row("Total kept", _fmt_time(decision.total_kept))
+    if out_path is not None:
+        table.add_row("Output", str(out_path))
     console.print(table)
 
 

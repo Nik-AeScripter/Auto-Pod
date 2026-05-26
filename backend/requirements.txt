@@ -1,12 +1,17 @@
+# --- Core CLI / API ---
+typer>=0.12.5
+rich>=13.9.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 pydantic>=2.9.0
-typer>=0.12.5
-rich>=13.9.0
+
+# --- Audio I/O ---
 numpy>=1.26.0
-scipy>=1.13.0
-faster-whisper>=1.0.3
 soundfile>=0.12.1
-librosa>=0.10.2
-scikit-learn>=1.5.0
+
+# --- Silero VAD (silence-removal feature) ---
+silero-vad>=5.1
+torch>=2.2.0
+torchaudio>=2.2.0
+
