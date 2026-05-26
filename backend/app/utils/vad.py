@@ -72,14 +72,21 @@ def detect_speech_intervals(
 
     Input MUST be a 16 kHz mono WAV file. Extract it first with
     ffmpeg.extract_audio_wav().
+
+    Implementation note: we do NOT use silero-vad's `read_audio` helper because
+    on recent torchaudio (>=2.9) it raises a torchcodec dependency error. We
+    read the WAV with `soundfile` ourselves and hand a plain torch tensor to
+    `get_speech_timestamps`, which the silero model accepts directly.
     """
     cfg = cfg or VADConfig()
     model = get_model()
 
-    # silero-vad's helpers want a torch tensor; load via their reader to be safe.
-    from silero_vad import read_audio, get_speech_timestamps  # type: ignore
+    # We read with soundfile (no torchaudio) and pass a torch tensor directly.
+    import torch  # type: ignore
+    from silero_vad import get_speech_timestamps  # type: ignore
 
-    wav = read_audio(str(wav_16k_mono_path), sampling_rate=VAD_SAMPLE_RATE)
+    samples = _read_audio_16k_mono(wav_16k_mono_path)
+    wav = torch.from_numpy(samples)
 
     timestamps = get_speech_timestamps(
         wav,

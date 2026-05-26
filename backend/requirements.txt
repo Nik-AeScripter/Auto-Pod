@@ -11,7 +11,11 @@ numpy>=1.26.0
 soundfile>=0.12.1
 
 # --- Silero VAD (silence-removal feature) ---
+# torchaudio >=2.9 requires a separate torchcodec package which silero-vad's
+# helpers don't yet handle, so we pin below that. We also avoid silero-vad's
+# read_audio() in our wrapper (we read WAV ourselves via soundfile) — the pin
+# is belt-and-suspenders so silero-vad still imports cleanly.
 silero-vad>=5.1
-torch>=2.2.0
-torchaudio>=2.2.0
+torch>=2.2.0,<2.9
+torchaudio>=2.2.0,<2.9
 
