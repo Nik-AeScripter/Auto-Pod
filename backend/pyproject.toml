@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "auto-pod"
 version = "0.1.0"
 description = "Local-first AI video editor: silence removal, repeat-takes, auto-chapters, auto-multicam."
-readme = "../README.md"
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
